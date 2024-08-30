@@ -5,6 +5,10 @@ import numpy
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.generation.stopping_criteria import StoppingCriteriaList, LLamaQaStoppingCriteria
 
+def jsd(p, q, base=torch.tensor(2.0)):
+    m = 0.5 * (p + q)
+    return 0.5 * (F.kl_div(p, m, reduction='batchmean', log_target=True) + F.kl_div(q, m, reduction='batchmean', log_target=True)) / torch.log(base)
+
 class Baseline:
     def __init__(self, model_name, device, num_gpus, max_gpu_memory=24):
         self.model_name = model_name
@@ -77,6 +81,8 @@ class Baseline:
                 return self._model_generate_base_argmax(prompt_ids, initial_length_prompt,all_choices, max_new_tokens, layer)
             elif mode == "DOLA":
                 return self._model_generate_dola(prompt_ids, initial_length_prompt,all_choices, max_new_tokens)
+            elif mode == "DOLA_jsd":
+                return self._model_generate_dola_jsd(prompt_ids, initial_length_prompt,all_choices, max_new_tokens)
             
             return self._generate(prompt_ids)
 
@@ -141,8 +147,41 @@ class Baseline:
         idea_probs = final_probs - max_kl_div_layer_prob
 
         return np.argmax(idea_probs)
-
     
+    def _model_generate_dola_jsd(self, prompt_ids, initial_length_prompt, all_choices, max_new_tokens, layer=None):
+        outputs = self.model(prompt_ids, output_hidden_states=True)
+        
+        # Final hidden state logits
+        final_hidden_state = self.model.lm_head(outputs.hidden_states[-1][:, -1, :])
+        choice_ids = [self.tokenizer.convert_tokens_to_ids(choice) for choice in all_choices]
+        logits_for_final_layer = final_hidden_state[0, choice_ids]
+        final_probs = torch.softmax(logits_for_final_layer, dim=0).detach().cpu().numpy()
+        
+        js_divergences = []
+        layer_probs = []
+        
+        for layer_idx, hidden_state in enumerate(outputs.hidden_states):
+            if layer_idx >= 1:
+                logits = self.model.lm_head(hidden_state[:, -1, :])
+                logits_for_choices = logits[0, choice_ids]
+                probs = torch.softmax(logits_for_choices, dim=0).detach().cpu().numpy()
+                
+                # JSD between the final layer probabilities and current layer
+                jsd_value = jsd(
+                    torch.softmax(torch.tensor(logits_for_choices), dim=0),
+                    torch.softmax(torch.tensor(logits_for_final_layer), dim=0)
+                )
+                js_divergences.append((jsd_value.item(), layer_idx))
+                layer_probs.append(probs)
+        
+        # Find the layer with the maximum JSD value
+        max_jsd_value, max_jsd_index = max(js_divergences, key=lambda x: x[0])
+        max_jsd_layer_prob = layer_probs[max_jsd_index - 1]
+        
+        # Idea: comparing final_probs with the most divergent layer's probs
+        idea_probs = final_probs - max_jsd_layer_prob
+
+        return np.argmax(idea_probs)
 
     def _model_generate_base(self, prompt_ids, initial_length_prompt, max_new_tokens):
         outputs = self.model.generate(
